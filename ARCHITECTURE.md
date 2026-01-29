@@ -1,271 +1,396 @@
-# Architecture Overview
+# Architecture Deep Dive
 
-## System Design Philosophy
-
-The Universal Retriever is built on three core principles:
-
-### 1. Federated Architecture
-Rather than a monolithic data acquisition engine, the system uses a federated model:
-- Independent retriever components run in parallel
-- Coordination layer manages lifecycle and communication
-- Isolation ensures failure in one source doesn't cascade
-- Bus pattern enables clean inter-process messaging
-
-**Benefit**: Scales horizontally, handles source-specific failures gracefully, maintainable subsystems.
-
-### 2. Event-Driven Design
-All operations are recorded as immutable events:
-- Events form audit trail
-- Event stream enables replay and analysis
-- Memory graph built from events
-- Enables deterministic replay and reconstruction
-
-**Benefit**: Complete auditability, replay capability, deterministic behavior, recovery support.
-
-### 3. Semantic Intelligence
-Raw metrics are converted to actionable insights:
-- Automatic performance analysis
-- Intelligent state classification
-- Network health assessment
-- Recommendation engine
-
-**Benefit**: Moves beyond observability to decision support, enables automation, reduces manual intervention.
+This document explains the **design philosophy** and **architectural trade-offs** behind the Universal Retriever system. For a feature overview and guarantee validation, see [README.md](README.md).
 
 ---
 
-## System Layers
+## 🎯 Design Philosophy
 
-### Input Layer
-- CLI interface
-- API endpoints
-- Programmatic access
-- Configuration-driven
+### Principle 1: Correctness Over Performance
+We chose explicit locks over lock-free structures because:
+- **Correctness is non-negotiable** in systems handling real data
+- Lock-free algorithms are harder to reason about and test
+- The performance cost is acceptable (<5% overhead)
+- **Trade-off:** Slightly slower, completely safe
 
-### Coordination Layer
-- Multi-threaded orchestration
-- Thread lifecycle management
-- Inter-process communication
-- Resource management
+### Principle 2: Determinism by Default
+We use OrderedDict and canonical serialization to ensure:
+- Same input always produces same output
+- Enables testing, debugging, and replay
+- Makes the system understandable (not "magical")
+- **Trade-off:** Slightly more code, perfect reproducibility
 
-### Data Acquisition Layer
-- Multiple parallel retrievers
-- Source-specific adapters
-- Error isolation
-- Retry logic
+### Principle 3: Explicit Over Implicit
+Recovery logic is explicit (not automatic) because:
+- Prevents silent data loss
+- Makes recovery visible in code and logs
+- Allows operators to understand what's happening
+- **Trade-off:** More boilerplate, more confidence
 
-### Persistence Layer
-- Event stream recording
-- Checkpoint system
-- JSON serialization
-- Resume capability
-
-### Analysis Layer
-- Event stream processing
-- Semantic enrichment
-- Classification engine
-- Recommendation generation
-
-### Output Layer
-- Insights API
-- CLI reporting
-- Programmatic access
-- Formatted output
+### Principle 4: Auditability First
+Event sourcing means every operation is recorded because:
+- Enables complete audit trail
+- Supports replay and debugging
+- Proves the system did what it claims
+- **Trade-off:** More storage, complete observability
 
 ---
 
-## Key Design Decisions
+## 🏗️ Architectural Layers
 
-### Thread Safety First
-**Decision**: Use explicit locks for memory operations rather than lock-free structures  
-**Rationale**: Correctness > performance for production systems  
-**Tradeoff**: Slight performance cost, guaranteed safety
+```
+INPUT LAYER
+  CLI interface / API / Programmatic access
+         ↓
+COORDINATION LAYER
+  Multi-threaded orchestration
+  Thread-safe memory management
+  Retriever lifecycle control
+         ↓
+DATA ACQUISITION LAYER
+  Multiple parallel retrievers
+  Source-specific adapters
+  Error isolation per source
+         ↓
+PERSISTENCE LAYER
+  Event stream recording
+  Checkpoint system
+  Atomic writes
+         ↓
+ANALYSIS LAYER
+  Event stream processing
+  Semantic enrichment
+  Classification engine
+         ↓
+OUTPUT LAYER
+  Insights API
+  CLI reporting
+  Programmatic access
+```
 
-### Deterministic Serialization
-**Decision**: Use OrderedDict to ensure consistent ordering in JSON output  
-**Rationale**: Same input must produce same output for reproducibility and testing  
-**Tradeoff**: Slightly more code, perfect reproducibility
-
-### Explicit Resume Logic
-**Decision**: Make checkpoint and resume logic explicit rather than automatic  
-**Rationale**: Prevents silent data loss, makes recovery visible  
-**Tradeoff**: More code, better reliability
-
-### Event Sourcing
-**Decision**: Record all operations as events rather than just final state  
-**Rationale**: Enables audit trail, replay, and deterministic reconstruction  
-**Tradeoff**: More storage, complete observability
-
-### Graceful Shutdown
-**Decision**: Daemon threads with timeout rather than hard kill  
-**Rationale**: Allows resources to clean up properly, prevents corruption  
-**Tradeoff**: Slower shutdown, data integrity
+**Why This Structure?**
+- **Separation of concerns:** Each layer has one responsibility
+- **Testability:** Each layer can be tested independently
+- **Scalability:** Layers can be replaced/upgraded independently
+- **Maintainability:** Clear dependencies and interfaces
 
 ---
 
-## Scalability Considerations
+## 🔒 Thread Safety Strategy
 
-### Current Scope
-- **Single-node**: CPU-bound by coordination overhead
-- **Small federation**: Network communication is bottleneck
-- **Design**: Horizontally scalable by architecture
+### The Challenge
+Multiple retrievers running in parallel, trying to update shared memory graph.
 
-### Future Scaling Paths
+### Our Solution
 
-**Path 1: Message Queue Integration**
-- Add distributed message queue (RabbitMQ, Kafka)
-- Coordinator becomes stateless
-- Enable multiple coordinator instances
-- Enables true horizontal scaling
+**1. Explicit Locks**
+- Lock acquired before every memory write
+- Lock released immediately after update
+- Prevents simultaneous writes
 
-**Path 2: Distributed State**
-- Move memory graph to distributed database
-- Add caching layer for performance
-- Enable multi-region deployment
-- Support high-availability setup
+```python
+# Pseudo-code
+with memory_lock:
+    memory_graph.record_event(...)  # Safe
+```
 
-**Path 3: Streaming Integration**
+**2. Atomic Operations**
+- Checkpoint writes are atomic (all-or-nothing)
+- No partial updates that could corrupt state
+- Prevents "halfway written" files
+
+**3. Lock Ordering**
+- Always acquire locks in same order (prevents deadlock)
+- Clear documentation of who holds which locks
+- Stress tested with 100+ concurrent operations
+
+### Why This Works
+- ✅ Simple to reason about
+- ✅ Easy to test (lock discipline verifiable)
+- ✅ Prevents data corruption
+- ✅ Performance cost acceptable
+
+### What We Don't Do
+- ❌ Lock-free algorithms (too complex to verify)
+- ❌ Optimistic locking (requires careful conflict resolution)
+- ❌ Distributed consensus (reserved for future scaling)
+
+---
+
+## 🔄 Event Sourcing Pattern
+
+### What It Is
+Every operation recorded as immutable event, then events replayed to reconstruct state.
+
+### Why We Use It
+
+**Auditability**
+- Complete record of what happened
+- Proves system behaved correctly
+- Enables investigation of failures
+
+**Reproducibility**
+- Replay event stream → identical output
+- Enables debugging without live system
+- Supports regression testing
+
+**Recovery**
+- Checkpoint captures event stream position
+- On crash: replay from checkpoint
+- No data loss (all events already written)
+
+### Example Flow
+```
+User: "Retrieve card_ids 1, 2, 3"
+         ↓
+System records event: {fetch_start, [1,2,3], timestamp}
+         ↓
+Retrievers work, record event per item: {fetch_complete, 1, latency, timestamp}
+         ↓
+System records event: {analysis_start, timestamp}
+         ↓
+Analysis complete, record: {analysis_complete, results, timestamp}
+         ↓
+Checkpoint created: {event_count: 5, hash: xxx, timestamp}
+         ↓
+(If crash happened here...)
+         ↓
+Recovery: Load checkpoint, replay events 1-5, continue from event 6
+```
+
+### Trade-offs
+- ✅ Complete auditability
+- ✅ Perfect reproducibility
+- ✅ Lossless recovery
+- ❌ Higher storage usage
+- ❌ Slightly more complex code
+
+---
+
+## 🎯 Semantic Intelligence Design
+
+### Problem
+Raw metrics don't tell you what to do:
+```
+Error rate: 15%
+Latency: 2.3s
+Success: 85%
+```
+
+"Should I panic? Should I adjust concurrency? Should I skip this source?"
+
+### Solution
+Classify metrics into actionable states:
+
+```
+HEALTHY → "Everything fine, maintain current load"
+DEGRADED → "Something's wrong, investigate"
+UNSTABLE → "Probably temporary, increase retry"
+FAILING → "Source is down, bypass or wait"
+```
+
+### Implementation
+
+**1. Collect Metrics**
+- Count successes and errors per retriever
+- Track latency distribution
+- Record error categories
+
+**2. Compute Statistics**
+- Success rate = successes / (successes + errors)
+- Average latency = sum(latencies) / count
+- Error proportion = errors / total
+
+**3. Apply Classification Rules**
+```
+IF reliability >= 95% AND latency < 1.0s:
+    state = "STABLE"
+ELIF reliability >= 85% AND latency < 2.0s:
+    state = "HEALTHY"
+ELIF reliability >= 70%:
+    state = "DEGRADED"
+ELIF reliability >= 50%:
+    state = "UNSTABLE"
+ELSE:
+    state = "FAILING"
+```
+
+**4. Generate Recommendations**
+```
+IF state == "FAILING":
+    alert = "🔴 CRITICAL"
+    recommendation = "Source is down, bypass it"
+ELIF error_rate_increasing:
+    alert = "🟠 WARNING"
+    recommendation = "Error spike detected, reduce concurrency"
+ELIF latency_increasing:
+    alert = "🟡 INFO"
+    recommendation = "Latency trend up, consider backoff"
+```
+
+### Why This Works
+- Moves from observation to action
+- Reduces manual decision-making
+- Works with real data from real systems
+
+---
+
+## 🔐 Determinism Guarantees
+
+### Challenge
+Multi-threaded systems are inherently non-deterministic. How do we make ours deterministic?
+
+### Solution
+
+**1. OrderedDict**
+- Python dict insertion order is only guaranteed since 3.7
+- OrderedDict is explicit about ordering
+- Ensures consistent serialization
+
+**2. Canonical Serialization**
+- JSON keys always in same order
+- No floating-point representation variance
+- Same input always produces same JSON
+
+**3. Single-Writer Event Log**
+- Only one thread appends to event log
+- Prevents interleaved writes
+- Enables reliable checkpointing
+
+### Validation
+Test strategy: 
+1. Run retrieval N times
+2. Compute hash of output each time
+3. Verify all hashes identical
+4. Tests prove determinism
+
+---
+
+## 💾 Checkpoint & Recovery Design
+
+### Problem
+System crashes mid-operation. How do we recover without losing data?
+
+### Solution
+
+**Checkpoint Manifest**
+```json
+{
+  "checkpoint_id": "cp_12345",
+  "timestamp": "2026-01-29T14:32:01Z",
+  "event_count": 1250,
+  "hash": "a3b2c1d0...",
+  "retriever_states": {
+    "scryfall_01": {"status": "healthy", "last_event": 1250}
+  },
+  "recovery_info": {"resume_from_event": 1250}
+}
+```
+
+**Recovery Process**
+1. Load checkpoint manifest
+2. Verify hash of events up to checkpoint
+3. Start from `resume_from_event`
+4. Continue normal operation
+
+**Why It Works**
+- ✅ Atomic write (manifest all-or-nothing)
+- ✅ Hash validation (detect corruption)
+- ✅ Explicit resume point (no guessing)
+- ✅ No data loss (all events already persisted)
+
+### Trade-offs
+- ✅ Lossless recovery
+- ✅ Verifiable correctness
+- ❌ Requires explicit checkpoint calls
+- ❌ Slightly more complex code
+
+---
+
+## 🚀 Scalability Roadmap
+
+### Current: Single-Node + Small Federation
+- All coordination in-process
+- Memory graph on local disk
+- Suitable for 1-10 retrievers
+
+### Future: Distributed System
+**Option 1: Message Queue**
+- Add RabbitMQ/Kafka for inter-process communication
+- Coordinator becomes stateless (horizontal scalable)
+- Memory graph moves to distributed storage
+
+**Option 2: Event Stream**
 - Export events to streaming platform
-- Enable real-time analytics
-- Support multiple consumers
-- Enable event replay from stream
+- Multiple consumers can process independently
+- Event log becomes system of record
+
+**Option 3: Hybrid**
+- Local memory graph for fast queries
+- Distributed event log for durability
+- Best of both worlds
+
+### Extensibility Points
+The current design enables future scaling because:
+- Event log is already designed to be distributed
+- Coordinator state is already isolated
+- Memory graph operations are already atomic
+- No implicit dependencies on single-node execution
 
 ---
 
-## Reliability Mechanisms
+## 🧪 Testing Strategy
 
-### Data Integrity
-- Thread-safe memory operations
-- Atomic checkpoint writes
-- Deterministic serialization
-- Explicit error handling
+### Unit Tests
+- Individual components in isolation
+- Mock external dependencies
+- Focus: correctness of logic
 
-### Availability
-- Source failure isolation
-- Automatic retry logic
-- Graceful degradation
-- Resume from checkpoint
+### Integration Tests
+- Multiple components together
+- Real event flow
+- Focus: interactions between layers
 
-### Durability
-- Event sourcing
-- Regular checkpointing
-- Atomic persistence
-- Recovery procedures
+### Stress Tests
+- Concurrent operations
+- High throughput scenarios
+- Focus: thread safety, no data loss
 
-### Observability
-- Event stream audit trail
-- Automatic performance metrics
-- Semantic health assessment
-- Actionable alerts
+### Determinism Tests
+- Run same scenario multiple times
+- Compute hash of outputs
+- Verify identical results
+- Focus: reproducibility
 
----
-
-## Performance Characteristics
-
-### Throughput
-- Limited by source rate limits
-- Coordination overhead <5% CPU
-- Memory usage linear with event count
-- Scales with parallel retrievers
-
-### Latency
-- Single operation: 0.5-1.5s
-- End-to-end: Depends on total items
-- Analysis: Negligible overhead
-- Reporting: Milliseconds
-
-### Scalability
-- Horizontal: Add more retrievers
-- Vertical: Tune coordination parameters
-- Time: Scales with item count linearly
-- Space: Events + graph in memory
+### Edge Case Tests
+- One retriever fails → others continue
+- All retrievers fail → graceful degradation
+- Crash during checkpoint write → recovery works
+- Config schema violation → early rejection
+- Focus: robustness
 
 ---
 
-## Testing & Validation
+## 🎯 Design Trade-offs Summary
 
-### Thread Safety Validation
-- Concurrent retrieval testing
-- Memory corruption detection
-- Race condition identification
-- Deadlock prevention verification
-
-### Determinism Testing
-- Same input reproducibility
-- Hash consistency
-- Ordering verification
-- Replay validation
-
-### Reliability Testing
-- Failure scenario simulation
-- Recovery procedure validation
-- Data loss prevention verification
-- Graceful degradation testing
+| Design Choice | Benefit | Cost | Why We Chose It |
+|---------------|---------|------|-----------------|
+| Explicit locks | Thread safety | Slight perf | Correctness > speed |
+| Event sourcing | Auditability + replay | Storage | Debugging + recovery |
+| OrderedDict | Determinism | Code | Reproducibility |
+| Explicit recovery | Safety | Boilerplate | No silent failures |
+| Semantic classification | Actionable insights | Complexity | Ops simplification |
+| Private code | Responsible disclosure | Access control | Professional judgment |
 
 ---
 
-## Comparison to Alternatives
+## 🔗 Related
 
-### vs. ETL Frameworks
-- ✅ Simpler, more focused
-- ✅ Better for lightweight use cases
-- ❌ Less feature-rich for complex pipelines
-- ❌ No built-in scheduling
-
-### vs. Message Queues
-- ✅ No infrastructure setup
-- ✅ In-process deployment
-- ✅ Semantic intelligence built-in
-- ❌ Single-node only (currently)
-
-### vs. Data Lakes
-- ✅ Lightweight and focused
-- ✅ No separate infrastructure
-- ✅ Designed for retrieval, not storage
-- ❌ Not for large-scale analytics
-
-### vs. Custom Solutions
-- ✅ Production-hardened
-- ✅ Proven reliability mechanisms
-- ✅ Clean architecture
-- ❌ Not available, use only by understanding
+- **Feature Overview:** [README.md](README.md) — What it does and why
+- **Proof & Evidence:** See README.md "Proof & Evidence" section
+- **Implementation:** Private portfolio repo (available on request)
 
 ---
 
-## Deployment Considerations
+**Philosophy:** Architecture should be understandable, testable, and defensible. Every design choice should have a reason.
 
-### Single-Node Deployment
-- No infrastructure required
-- Perfect for development/testing
-- Suitable for small-scale production
-- Limited by machine resources
-
-### Small Federation
-- Multiple retriever instances
-- Central coordinator
-- Shared memory graph
-- Suitable for medium workloads
-
-### Distributed Deployment (Future)
-- Would require message queue
-- Distributed state management
-- Multiple coordinators
-- Suitable for large-scale production
-
----
-
-## Philosophy Summary
-
-The Universal Retriever is built on the principle that **production-grade systems should be the default, not an afterthought**.
-
-This means:
-- ✅ Thread safety by design
-- ✅ Deterministic behavior as requirement
-- ✅ Graceful handling of failure modes
-- ✅ Complete auditability and traceability
-- ✅ Semantic intelligence enabling decisions
-
-This approach trades development complexity for operational reliability — the right tradeoff for any system that handles real data.
-
----
-
-**For implementation details, request access to the complete portfolio edition.**
